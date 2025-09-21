@@ -21,6 +21,13 @@ import (
 	"github.com/prometheus/alertmanager/api/v2/client"
 	"github.com/prometheus/alertmanager/api/v2/client/alert"
 	"github.com/prometheus/alertmanager/api/v2/models"
+
+	// SQL drivers
+	_ "github.com/go-sql-driver/mysql"  // MySQL
+	_ "github.com/jackc/pgx/v5/stdlib"  // PostgreSQL (pgx)
+	_ "github.com/lib/pq"               // PostgreSQL (postgres)
+	_ "github.com/mattn/go-sqlite3"     // SQLite
+	_ "github.com/microsoft/go-mssqldb" // SQL Server
 )
 
 type AlertRule struct {
