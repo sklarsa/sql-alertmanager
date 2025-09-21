@@ -43,6 +43,7 @@ func main() {
 	amPath := flag.String("alertManagerPath", "/api/v2/", "alert manager v2 api path")
 	configPath := flag.String("config", "./config.yaml", "path to config")
 	maxRequestTimeout := flag.Duration("maxRequestTimeout", time.Second*5, "request to alertmanager timeout")
+	statePath := flag.String("state", "./alertstate.json", "path of local state file")
 	debug := flag.Bool("debug", false, "show debug logs")
 	flag.Parse()
 
@@ -55,6 +56,15 @@ func main() {
 		}(),
 	})
 	slog.SetDefault(slog.New(handler))
+
+	// Load the state store
+	store := NewManager(*statePath)
+	if err := store.Load(); err != nil {
+		slog.Error("error loading state file",
+			"path", *statePath,
+			"error", err,
+		)
+	}
 
 	// Unmarshal the config file
 	conf := Config{}
@@ -131,10 +141,10 @@ func main() {
 					// create a list of firingAlerts.
 					firingAlerts := models.PostableAlerts{}
 					func() {
-						ctx, cancel := context.WithTimeout(ctx, r.EvaluateFreq/2)
+						queryCtx, cancel := context.WithTimeout(ctx, r.EvaluateFreq/2)
 						defer cancel()
 
-						rows, err := db.QueryContext(ctx, r.Query)
+						rows, err := db.QueryContext(queryCtx, r.Query)
 						if err != nil {
 							slog.Error("query failed",
 								"name", r.Name,
@@ -233,6 +243,17 @@ func main() {
 						"count", len(firingAlerts),
 					)
 
+					// Mark active alerts in store and
+					// drop any alerts that have not hit the "for" threshold
+					filteredAlerts := models.PostableAlerts{}
+					for _, alert := range firingAlerts {
+						k := key(alert.Labels)
+						store.MarkActive(k)
+						if store.ShouldFire(k, r.For) {
+							filteredAlerts = append(filteredAlerts, alert)
+						}
+					}
+
 					// Get existing alerts from alertmanager
 					getCtx, cancel := context.WithTimeout(ctx, *maxRequestTimeout)
 
@@ -264,10 +285,10 @@ func main() {
 					// existingAlert, compare it to each firingAlert,
 					// and append it to firingAlert (with an end time) if it
 					// is no longer firing.
-					firingAlertLen := len(firingAlerts)
 					for _, existing := range existingAlerts {
 						var found bool
-						for idx := range firingAlertLen {
+						for idx := range firingAlerts {
+							// todo: use key func here once we can cache the results
 							if reflect.DeepEqual(existing.Labels, firingAlerts[idx].Labels) {
 								// If we find that the alert is still firing, we
 								// need to ensure that its StartsAt matches the old alert
@@ -278,11 +299,12 @@ func main() {
 							}
 						}
 						if !found {
-							firingAlerts = append(firingAlerts, &models.PostableAlert{
+							filteredAlerts = append(filteredAlerts, &models.PostableAlert{
 								Alert:    existing.Alert,
 								StartsAt: *existing.StartsAt,
 								EndsAt:   strfmt.DateTime(time.Now()),
 							})
+							store.MarkResolved(key(existing.Labels))
 						}
 					}
 
@@ -293,24 +315,24 @@ func main() {
 
 						params := alert.NewPostAlertsParams().
 							WithContext(postCtx).
-							WithAlerts(firingAlerts)
+							WithAlerts(filteredAlerts)
 
 						resp, err := amClient.Alert.PostAlerts(params)
 						if err != nil {
 							slog.Error("failed to send alerts",
 								"name", r.Name,
-								"count", len(firingAlerts))
+								"count", len(filteredAlerts))
 							return
 						}
 
 						if resp.IsSuccess() {
 							slog.Info("alerts sent",
 								"name", r.Name,
-								"count", len(firingAlerts))
+								"count", len(filteredAlerts))
 						} else {
 							slog.Error("failed to send alerts",
 								"name", r.Name,
-								"count", len(firingAlerts),
+								"count", len(filteredAlerts),
 								"code", resp.Code(),
 								"error", resp.Error(),
 							)
