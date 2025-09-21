@@ -14,19 +14,23 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/goccy/go-yaml"
-
 	"github.com/go-openapi/strfmt"
+	"github.com/goccy/go-yaml"
 	"github.com/prometheus/alertmanager/api/v2/client"
 	"github.com/prometheus/alertmanager/api/v2/client/alert"
 	"github.com/prometheus/alertmanager/api/v2/models"
 )
 
 type AlertRule struct {
-	Query        string          `json:"query"`
-	EvaluateFreq time.Duration   `json:"evaluateFreq"`
-	Labels       models.LabelSet `json:"labelSet"`
-	Annotations  models.LabelSet `json:"annotations"`
+	Query        string          `yaml:"query"`
+	EvaluateFreq time.Duration   `yaml:"evaluateFreq"`
+	Labels       models.LabelSet `yaml:"labelSet"`
+	Annotations  models.LabelSet `yaml:"annotations"`
+}
+
+type Config struct {
+	Db    string      `yaml:"db"`
+	Rules []AlertRule `yaml:"rules"`
 }
 
 func (r AlertRule) baseArgs() []any {
@@ -46,23 +50,34 @@ func (r AlertRule) queryArgs() []any {
 }
 
 func main() {
-	connStr := os.Args[1]
 	driver := flag.String("driver", "pgx", "sql driver to use")
 	amHost := flag.String("alertManagerHost", "localhost", "hostname for alert manager")
 	amPath := flag.String("alertManagerPath", "/api/v2/", "alert manager v2 api path")
 	configPath := flag.String("config", "./config.yaml", "path to config")
 	maxPostTimeout := flag.Duration("maxPostTimeout", time.Second*5, "post to alertmanager timeout")
+	debug := flag.Bool("debug", false, "show debug logs")
 	flag.Parse()
+
+	handler := slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+		Level: func() slog.Leveler {
+			if *debug {
+				return slog.LevelDebug
+			}
+			return slog.LevelInfo
+		}(),
+	})
+	slog.SetDefault(slog.New(handler))
 
 	f, err := os.Open(*configPath)
 	if err != nil {
 		log.Fatalf("error opening config file: %s", err)
 	}
+	defer f.Close()
 
-	rules := []AlertRule{}
+	conf := Config{}
 
 	decoder := yaml.NewDecoder(f, yaml.DisallowUnknownField(), yaml.UseJSONUnmarshaler())
-	err = decoder.Decode(&rules)
+	err = decoder.Decode(&conf)
 	if err != nil && !errors.Is(err, io.EOF) {
 		log.Fatalf("error parsing yaml: %s", err)
 	}
@@ -80,7 +95,7 @@ func main() {
 
 	wg := &sync.WaitGroup{}
 
-	db, err := sql.Open(*driver, connStr)
+	db, err := sql.Open(*driver, conf.Db)
 	if err != nil {
 		log.Fatalf(
 			"error opening connection with %q driver: %s\n",
@@ -94,7 +109,7 @@ func main() {
 		log.Fatalf("DB connection test failed: %s", err)
 	}
 
-	for _, r := range rules {
+	for _, r := range conf.Rules {
 		wg.Add(1)
 		go func(r AlertRule) {
 			defer wg.Done()
@@ -115,7 +130,7 @@ func main() {
 					)
 
 					func() {
-						rows, err := db.Query(r.Query)
+						rows, err := db.QueryContext(ctx, r.Query)
 						if err != nil {
 							slog.Error("query failed", r.errorArgs(err)...)
 							return
@@ -134,7 +149,10 @@ func main() {
 						}
 						if err := rows.Err(); err != nil {
 							slog.Error("row iteration error", r.errorArgs(err)...)
+							return
 						}
+
+						slog.Debug("alerts found", append(r.baseArgs(), "count", len(alerts))...)
 
 						if len(alerts) == 0 {
 							return
