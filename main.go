@@ -22,31 +22,17 @@ import (
 )
 
 type AlertRule struct {
-	Query        string          `yaml:"query"`
-	EvaluateFreq time.Duration   `yaml:"evaluateFreq"`
-	Labels       models.LabelSet `yaml:"labelSet"`
-	Annotations  models.LabelSet `yaml:"annotations"`
+	Name           string        `yaml:"name"`
+	Query          string        `yaml:"query"`
+	EvaluateFreq   time.Duration `yaml:"evaluateFreq"`
+	LabelCols      []string      `yaml:"labelCols"`
+	AnnotationCols []string      `yaml:"annotationCols"`
+	For            time.Duration `yaml:"for"`
 }
 
 type Config struct {
 	Db    string      `yaml:"db"`
 	Rules []AlertRule `yaml:"rules"`
-}
-
-func (r AlertRule) baseArgs() []any {
-	baseArgs := make([]any, 0, len(r.Labels)*2)
-	for k, v := range r.Labels {
-		baseArgs = append(baseArgs, k, v)
-	}
-	return baseArgs
-}
-
-func (r AlertRule) errorArgs(err error) []any {
-	return append(r.baseArgs(), "error", err.Error())
-}
-
-func (r AlertRule) queryArgs() []any {
-	return append(r.baseArgs(), "query", r.Query)
 }
 
 func main() {
@@ -105,6 +91,11 @@ func main() {
 	}
 	defer db.Close()
 
+	db.SetMaxOpenConns(10)
+	db.SetMaxIdleConns(5)
+	db.SetConnMaxLifetime(30 * time.Minute)
+	db.SetConnMaxIdleTime(5 * time.Minute)
+
 	if err := db.Ping(); err != nil {
 		log.Fatalf("DB connection test failed: %s", err)
 	}
@@ -113,7 +104,7 @@ func main() {
 		wg.Add(1)
 		go func(r AlertRule) {
 			defer wg.Done()
-			slog.Info("registered rule", r.baseArgs()...)
+			slog.Info("registered rule", "name", r.Name)
 
 			ticker := time.NewTicker(r.EvaluateFreq)
 			defer ticker.Stop()
@@ -121,62 +112,150 @@ func main() {
 			for {
 				select {
 				case <-ctx.Done():
-					slog.Info("rule stopped", r.baseArgs()...)
+					slog.Info("rule stopped", "name", r.Name)
 					return
 				case <-ticker.C:
 
 					slog.Debug("executing query",
-						r.queryArgs()...,
+						"name", r.Name,
+						"query", r.Query,
 					)
 
+					// Execute the rule query and parse results to
+					// create a list of alerts.
+					alerts := make([]*models.PostableAlert, 0, 32)
 					func() {
+
+						ctx, cancel := context.WithTimeout(ctx, r.EvaluateFreq/2)
+
 						rows, err := db.QueryContext(ctx, r.Query)
+						cancel()
 						if err != nil {
-							slog.Error("query failed", r.errorArgs(err)...)
+							slog.Error("query failed",
+								"name", r.Name,
+								"error", err.Error())
 							return
 						}
 						defer rows.Close()
 
-						alerts := []*models.PostableAlert{}
+						cols, err := rows.Columns()
+						if err != nil {
+							slog.Error("error getting columns",
+								"name", r.Name,
+								"error", err)
+							return
+						}
+
+						colSet := map[string]struct{}{}
+						for _, c := range cols {
+							colSet[c] = struct{}{}
+						}
+						for _, c := range append(r.LabelCols, r.AnnotationCols...) {
+							if _, ok := colSet[c]; !ok {
+								slog.Warn("column missing from query result", "name", r.Name, "column", c)
+							}
+						}
+
 						for rows.Next() {
+							raw := make([]sql.RawBytes, len(cols))
+							ptrs := make([]any, len(cols))
+							for i := range raw {
+								ptrs[i] = &raw[i]
+							}
+
+							if err = rows.Scan(ptrs...); err != nil {
+								slog.Error("error scanning row",
+									"name", r.Name,
+									"error", err.Error())
+								return
+							}
+
+							row := make(map[string]string, len(cols))
+							for i, col := range cols {
+								if raw[i] == nil {
+									row[col] = ""
+								} else {
+									row[col] = string(raw[i])
+								}
+							}
+
+							annotations := map[string]string{}
+							labels := map[string]string{}
+
+							for _, col := range r.AnnotationCols {
+								val := row[col]
+								if val != "" {
+									annotations[col] = val
+								}
+							}
+
+							for _, col := range r.LabelCols {
+								val := row[col]
+								if val != "" {
+									labels[col] = val
+								}
+							}
+							labels["alertname"] = r.Name
+
 							alerts = append(alerts, &models.PostableAlert{
-								Annotations: r.Annotations,
+								Annotations: annotations,
 								StartsAt:    strfmt.DateTime(time.Now()),
 								Alert: models.Alert{
-									Labels: r.Labels,
+									Labels: labels,
 								},
 							})
 						}
-						if err := rows.Err(); err != nil {
-							slog.Error("row iteration error", r.errorArgs(err)...)
+
+						err = rows.Err()
+						if err != nil {
+							slog.Error("error processing query data",
+								"name", r.Name,
+								"error", err.Error(),
+							)
 							return
 						}
+					}()
 
-						slog.Debug("alerts found", append(r.baseArgs(), "count", len(alerts))...)
+					if len(alerts) == 0 {
+						slog.Debug("alerts found",
+							"name", r.Name,
+							"count", len(alerts),
+						)
+						return
+					}
 
-						if len(alerts) == 0 {
-							return
-						}
+					slog.Info("no alerts found",
+						"name", r.Name,
+					)
+
+					// Post alerts to alertmanager
+					func() {
+						postCtx, cancel := context.WithTimeout(ctx, *maxPostTimeout)
+						defer cancel()
 
 						params := alert.NewPostAlertsParams().
-							WithContext(ctx).
-							WithAlerts(alerts).
-							WithTimeout(*maxPostTimeout)
+							WithContext(postCtx).
+							WithAlerts(alerts)
+
 						resp, err := amClient.Alert.PostAlerts(params)
 						if err != nil {
-							slog.Error("failed to send alert", r.errorArgs(err)...)
+							slog.Error("failed to send alerts",
+								"name", r.Name,
+								"count", len(alerts))
 							return
 						}
 
 						if resp.IsSuccess() {
-							slog.Info("alert sent", r.baseArgs()...)
+							slog.Info("alerts sent",
+								"name", r.Name,
+								"count", len(alerts))
 						} else {
-							args := r.baseArgs()
-							args = append(args,
+							slog.Error("failed to send alerts",
+								"name", r.Name,
+								"count", len(alerts),
 								"code", resp.Code(),
 								"error", resp.Error(),
 							)
-							slog.Error("failed to send alert", args...)
 						}
 					}()
 				}
