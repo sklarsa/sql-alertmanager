@@ -5,11 +5,13 @@ import (
 	"database/sql"
 	"errors"
 	"flag"
+	"fmt"
 	"io"
 	"log"
 	"log/slog"
 	"os"
 	"os/signal"
+	"reflect"
 	"sync"
 	"syscall"
 	"time"
@@ -40,7 +42,7 @@ func main() {
 	amHost := flag.String("alertManagerHost", "localhost", "hostname for alert manager")
 	amPath := flag.String("alertManagerPath", "/api/v2/", "alert manager v2 api path")
 	configPath := flag.String("config", "./config.yaml", "path to config")
-	maxPostTimeout := flag.Duration("maxPostTimeout", time.Second*5, "post to alertmanager timeout")
+	maxRequestTimeout := flag.Duration("maxRequestTimeout", time.Second*5, "request to alertmanager timeout")
 	debug := flag.Bool("debug", false, "show debug logs")
 	flag.Parse()
 
@@ -54,20 +56,21 @@ func main() {
 	})
 	slog.SetDefault(slog.New(handler))
 
+	// Unmarshal the config file
+	conf := Config{}
 	f, err := os.Open(*configPath)
 	if err != nil {
 		log.Fatalf("error opening config file: %s", err)
 	}
-	defer f.Close()
-
-	conf := Config{}
 
 	decoder := yaml.NewDecoder(f, yaml.DisallowUnknownField(), yaml.UseJSONUnmarshaler())
 	err = decoder.Decode(&conf)
+	f.Close()
 	if err != nil && !errors.Is(err, io.EOF) {
 		log.Fatalf("error parsing yaml: %s", err)
 	}
 
+	// Set up the alertmanager client
 	amClient := client.NewHTTPClientWithConfig(
 		strfmt.Default,
 		client.DefaultTransportConfig().
@@ -75,12 +78,14 @@ func main() {
 			WithBasePath(*amPath),
 	)
 
+	// Set up signal-based cancellation behavior
 	ctx, cancel := context.WithCancel(context.Background())
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
 
 	wg := &sync.WaitGroup{}
 
+	// Open and configure a connection to the target database
 	db, err := sql.Open(*driver, conf.Db)
 	if err != nil {
 		log.Fatalf(
@@ -100,6 +105,8 @@ func main() {
 		log.Fatalf("DB connection test failed: %s", err)
 	}
 
+	// Create a goroutine-per-rule that will evaluate each rule
+	// and post updates to alertmanager as state changes
 	for _, r := range conf.Rules {
 		wg.Add(1)
 		go func(r AlertRule) {
@@ -115,21 +122,19 @@ func main() {
 					slog.Info("rule stopped", "name", r.Name)
 					return
 				case <-ticker.C:
-
 					slog.Debug("executing query",
 						"name", r.Name,
 						"query", r.Query,
 					)
 
 					// Execute the rule query and parse results to
-					// create a list of alerts.
-					alerts := make([]*models.PostableAlert, 0, 32)
+					// create a list of firingAlerts.
+					firingAlerts := models.PostableAlerts{}
 					func() {
-
 						ctx, cancel := context.WithTimeout(ctx, r.EvaluateFreq/2)
+						defer cancel()
 
 						rows, err := db.QueryContext(ctx, r.Query)
-						cancel()
 						if err != nil {
 							slog.Error("query failed",
 								"name", r.Name,
@@ -197,7 +202,7 @@ func main() {
 							}
 							labels["alertname"] = r.Name
 
-							alerts = append(alerts, &models.PostableAlert{
+							firingAlerts = append(firingAlerts, &models.PostableAlert{
 								Annotations: annotations,
 								StartsAt:    strfmt.DateTime(time.Now()),
 								Alert: models.Alert{
@@ -216,43 +221,96 @@ func main() {
 						}
 					}()
 
-					if len(alerts) == 0 {
-						slog.Debug("alerts found",
+					if len(firingAlerts) == 0 {
+						slog.Debug("no alerts found",
 							"name", r.Name,
-							"count", len(alerts),
 						)
 						return
 					}
 
-					slog.Info("no alerts found",
+					slog.Info("alerts found",
 						"name", r.Name,
+						"count", len(firingAlerts),
 					)
 
-					// Post alerts to alertmanager
+					// Get existing alerts from alertmanager
+					getCtx, cancel := context.WithTimeout(ctx, *maxRequestTimeout)
+
+					active := true
+					params := alert.NewGetAlertsParams().
+						WithContext(getCtx).
+						WithActive(&active).
+						WithFilter([]string{
+							fmt.Sprintf("alertname=%s", r.Name),
+						})
+
+					resp, err := amClient.Alert.GetAlerts(params)
+					cancel()
+					if err != nil {
+						slog.Error("failed to get active alerts",
+							"name", r.Name,
+							"error", err)
+						return
+					}
+					existingAlerts := resp.Payload
+
+					// We care about alerts in 3 buckets:
+					// 1. New alerts
+					// 2. Old alerts that are still firing
+					// 3. Old alerts that have stopped firing
+					//
+					// We already have alerts from buckets 1 and 2 in the
+					// firingAlerts slice. We need to iterate through each
+					// existingAlert, compare it to each firingAlert,
+					// and append it to firingAlert (with an end time) if it
+					// is no longer firing.
+					firingAlertLen := len(firingAlerts)
+					for _, existing := range existingAlerts {
+						var found bool
+						for idx := range firingAlertLen {
+							if reflect.DeepEqual(existing.Labels, firingAlerts[idx].Labels) {
+								// If we find that the alert is still firing, we
+								// need to ensure that its StartsAt matches the old alert
+								// for consistency.
+								firingAlerts[idx].StartsAt = *existing.StartsAt
+								found = true
+								break
+							}
+						}
+						if !found {
+							firingAlerts = append(firingAlerts, &models.PostableAlert{
+								Alert:    existing.Alert,
+								StartsAt: *existing.StartsAt,
+								EndsAt:   strfmt.DateTime(time.Now()),
+							})
+						}
+					}
+
+					// Post all alerts to alertmanager
 					func() {
-						postCtx, cancel := context.WithTimeout(ctx, *maxPostTimeout)
+						postCtx, cancel := context.WithTimeout(ctx, *maxRequestTimeout)
 						defer cancel()
 
 						params := alert.NewPostAlertsParams().
 							WithContext(postCtx).
-							WithAlerts(alerts)
+							WithAlerts(firingAlerts)
 
 						resp, err := amClient.Alert.PostAlerts(params)
 						if err != nil {
 							slog.Error("failed to send alerts",
 								"name", r.Name,
-								"count", len(alerts))
+								"count", len(firingAlerts))
 							return
 						}
 
 						if resp.IsSuccess() {
 							slog.Info("alerts sent",
 								"name", r.Name,
-								"count", len(alerts))
+								"count", len(firingAlerts))
 						} else {
 							slog.Error("failed to send alerts",
 								"name", r.Name,
-								"count", len(alerts),
+								"count", len(firingAlerts),
 								"code", resp.Code(),
 								"error", resp.Error(),
 							)
