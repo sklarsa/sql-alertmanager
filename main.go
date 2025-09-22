@@ -82,7 +82,7 @@ func main() {
 
 	decoder := yaml.NewDecoder(f, yaml.DisallowUnknownField(), yaml.UseJSONUnmarshaler())
 	err = decoder.Decode(&conf)
-	f.Close()
+	_ = f.Close()
 	if err != nil && !errors.Is(err, io.EOF) {
 		log.Fatalf("error parsing yaml: %s", err)
 	}
@@ -111,7 +111,7 @@ func main() {
 			err,
 		)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	db.SetMaxOpenConns(10)
 	db.SetMaxIdleConns(5)
@@ -158,7 +158,7 @@ func main() {
 								"error", err.Error())
 							return
 						}
-						defer rows.Close()
+						defer func() { _ = rows.Close() }()
 
 						cols, err := rows.Columns()
 						if err != nil {
@@ -255,7 +255,11 @@ func main() {
 					filteredAlerts := models.PostableAlerts{}
 					for _, alert := range firingAlerts {
 						k := key(alert.Labels)
-						store.MarkActive(k)
+						if err = store.MarkActive(k); err != nil {
+							slog.Error("error storing alert state",
+								"name", r.Name,
+								"error", err)
+						}
 						if store.ShouldFire(k, r.For) {
 							filteredAlerts = append(filteredAlerts, alert)
 						}
@@ -311,7 +315,12 @@ func main() {
 								StartsAt: *existing.StartsAt,
 								EndsAt:   strfmt.DateTime(time.Now()),
 							})
-							store.MarkResolved(key(existing.Labels))
+							if err = store.MarkResolved(key(existing.Labels)); err != nil {
+								slog.Error("failed to mark alert as resolved",
+									"name", r.Name,
+									"error", err)
+								return
+							}
 						}
 					}
 
