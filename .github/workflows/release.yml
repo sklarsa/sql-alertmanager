@@ -1,0 +1,48 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  call-common:
+    uses: ./.github/workflows/common.yml
+    with:
+      tag: ${{ github.ref_name }}
+  push:
+    needs: call-common
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.ref_name }}
+    steps:
+    - uses: actions/checkout@v3
+    - name: Login to Docker Hub
+      uses: docker/login-action@v2
+      with:
+        username: ${{ secrets.DOCKER_USERNAME }}
+        password: ${{ secrets.DOCKER_PASSWORD }}
+    - name: Push Docker image
+      run: make docker-push
+  build-binaries:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+    - uses: actions/setup-go@v4
+      with:
+        go-version: '1.25'
+    - name: Create bin dir
+      run: mkdir bin
+    - name: Build linux amd64
+      run: GOOS=linux GOARCH=amd64 go build -o bin/sql-alertmanager-linux-amd64 .
+    - name: Build linux arm64
+      run: GOOS=linux GOARCH=arm64 go build -o bin/sql-alertmanager-linux-arm64 .
+    - name: Build darwin amd64
+      run: GOOS=darwin GOARCH=amd64 go build -o bin/sql-alertmanager-darwin-amd64 .
+    - name: Build darwin arm64
+      run: GOOS=darwin GOARCH=arm64 go build -o bin/sql-alertmanager-darwin-arm64 .
+    - name: Generate checksums
+      run: cd bin && sha256sum * > checksums.txt
+    - name: Upload assets
+      run: gh release upload ${{ github.ref_name }} bin/*
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
