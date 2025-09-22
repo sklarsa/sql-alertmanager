@@ -1,5 +1,5 @@
 IMAGE ?= sklarsa/sql-alertmanager
-TAG ?= $(shell git rev-parse --short HEAD)
+TAG = $(shell git describe --tags --always)
 
 .PHONY: docker-build docker-push build lint
 
